@@ -352,7 +352,31 @@ app.post("/api/payments/create-intent", async (req, res) => {
     // 3. Generate confirmation number
     const confirmationNumber = `EH-${Date.now().toString().slice(-5)}-${Math.floor(Math.random() * 9000 + 1000)}`;
 
-    // 4. Create booking record
+    // 4. Create Stripe charge if Stripe is configured
+    let stripePaymentIntentId = null;
+    if (stripe) {
+      try {
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: Math.round(totalCharged * 100),
+          currency: "usd",
+          payment_method_types: ["card"],
+          metadata: {
+            confirmationNumber,
+            eventId,
+            vendorEmail,
+            boothNumber: boothNumber?.toString() || "",
+          },
+          receipt_email: vendorEmail,
+          description: `Event Hopper — Booth #${boothNumber}`,
+          confirm: false,
+        });
+        stripePaymentIntentId = paymentIntent.id;
+      } catch (stripeErr) {
+        console.log("Stripe charge skipped:", stripeErr.message);
+      }
+    }
+
+    // 5. Create booking record
     const { data: booking, error: bookingError } = await supabase
       .from("bookings").insert({
         vendor_id: vendorId,
@@ -364,6 +388,7 @@ app.post("/api/payments/create-intent", async (req, res) => {
         booth_fee: price,
         platform_fee: platformFee,
         stripe_fee: stripeFee,
+        stripe_payment_intent_id: stripePaymentIntentId,
         qr_code_data: JSON.stringify({ confirmationNumber, eventId, boothNumber }),
         vendor_notes: vendorSelling || null,
       }).select().single();
