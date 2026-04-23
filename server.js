@@ -395,21 +395,43 @@ app.post("/api/payments/create-intent", async (req, res) => {
 
     if (bookingError) throw bookingError;
 
-    // 5. Mark booth as taken if we have booth ID
+    // 5. Mark booth as taken — try UUID first, then booth_number
+    let bookedBoothDbId = null;
     if (boothId) {
-      // Try by UUID first, then by booth_number as fallback
-      const { error: boothErr } = await supabase.from("booths")
+      // Try UUID first
+      const { data: boothByUUID, error: uuidErr } = await supabase.from("booths")
         .update({ status: "taken", locked_by: null, locked_until: null })
         .eq("id", boothId)
-        .eq("event_id", eventId);
-      
-      if (boothErr) {
-        console.log("Booth update by UUID failed, trying booth_number:", boothId);
-        await supabase.from("booths")
-          .update({ status: "taken" })
-          .eq("booth_number", parseInt(boothId))
-          .eq("event_id", eventId);
+        .eq("event_id", eventId)
+        .select("id").single();
+
+      if (!uuidErr && boothByUUID) {
+        bookedBoothDbId = boothByUUID.id;
+        console.log("✅ Booth marked taken by UUID:", boothId);
       }
+    }
+
+    // Try booth_number if UUID didn't work
+    if (!bookedBoothDbId && boothNumber) {
+      const { data: boothByNum, error: numErr } = await supabase.from("booths")
+        .update({ status: "taken" })
+        .eq("booth_number", parseInt(boothNumber))
+        .eq("event_id", eventId)
+        .select("id").single();
+
+      if (!numErr && boothByNum) {
+        bookedBoothDbId = boothByNum.id;
+        console.log("✅ Booth marked taken by booth_number:", boothNumber);
+      } else {
+        console.log("⚠️ Could not mark booth taken. boothId:", boothId, "boothNumber:", boothNumber);
+      }
+    }
+
+    // Update booking with booth_id if we found it
+    if (bookedBoothDbId) {
+      await supabase.from("bookings")
+        .update({ booth_id: bookedBoothDbId })
+        .eq("confirmation_number", confirmationNumber);
     }
     
     console.log("✅ Booking created:", confirmationNumber, "for", vendorEmail);
