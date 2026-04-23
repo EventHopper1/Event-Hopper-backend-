@@ -372,10 +372,22 @@ app.post("/api/payments/create-intent", async (req, res) => {
 
     // 5. Mark booth as taken if we have booth ID
     if (boothId) {
-      await supabase.from("booths")
-        .update({ status: "taken" })
-        .eq("id", boothId);
+      // Try by UUID first, then by booth_number as fallback
+      const { error: boothErr } = await supabase.from("booths")
+        .update({ status: "taken", locked_by: null, locked_until: null })
+        .eq("id", boothId)
+        .eq("event_id", eventId);
+      
+      if (boothErr) {
+        console.log("Booth update by UUID failed, trying booth_number:", boothId);
+        await supabase.from("booths")
+          .update({ status: "taken" })
+          .eq("booth_number", parseInt(boothId))
+          .eq("event_id", eventId);
+      }
     }
+    
+    console.log("✅ Booking created:", confirmationNumber, "for", vendorEmail);
 
     return res.status(200).json({
       success: true,
