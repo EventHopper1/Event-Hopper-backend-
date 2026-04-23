@@ -293,101 +293,89 @@ app.post("/api/bookings/lock", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────
 // ROUTE 2 — Create Stripe Payment Intent
 // POST /api/payments/create-intent
-// Body: { boothId, vendorId, eventId }
+// Body: { eventId, boothId, boothNumber, boothPrice, vendorName, vendorEmail, vendorBusiness, vendorPhone, vendorSelling }
 // ─────────────────────────────────────────────────────────────────
 app.post("/api/payments/create-intent", async (req, res) => {
-  const { boothId, vendorId, eventId } = req.body;
+  const { eventId, boothId, boothNumber, boothPrice, vendorName, vendorEmail, vendorBusiness, vendorPhone, vendorSelling } = req.body;
 
-  if (!boothId || !vendorId || !eventId) {
-    return res.status(400).json({ error: "boothId, vendorId, and eventId are required" });
+  if (!eventId || !vendorEmail || !vendorName) {
+    return res.status(400).json({ error: "eventId, vendorEmail, and vendorName are required" });
   }
 
   try {
-    // 1. Fetch booth + event + organizer in parallel
-    const [boothRes, eventRes, vendorRes] = await Promise.all([
-      supabase.from("booths").select("*").eq("id", boothId).single(),
-      supabase.from("events").select("*, organizer_profiles(stripe_account_id)").eq("id", eventId).single(),
-      supabase.from("users").select("*, vendor_profiles(*)").eq("id", vendorId).single(),
-    ]);
+    // 1. Find or create guest vendor user
+    let vendorId;
+    const { data: existingUser } = await supabase
+      .from("users").select("id").eq("email", vendorEmail).single();
 
-    if (boothRes.error || !boothRes.data) return res.status(404).json({ error: "Booth not found" });
-    if (eventRes.error || !eventRes.data) return res.status(404).json({ error: "Event not found" });
-    if (vendorRes.error || !vendorRes.data) return res.status(404).json({ error: "Vendor not found" });
+    if (existingUser) {
+      vendorId = existingUser.id;
+    } else {
+      const { data: newUser, error: userErr } = await supabase
+        .from("users").insert({
+          email: vendorEmail,
+          full_name: vendorName,
+          phone: vendorPhone || null,
+          role: "vendor",
+          account_type: "guest",
+          is_active: true,
+        }).select().single();
+      if (userErr) throw userErr;
+      vendorId = newUser.id;
 
-    const booth = boothRes.data;
-    const event = eventRes.data;
-    const vendor = vendorRes.data;
-    const organizerStripeAccount = event.organizer_profiles?.stripe_account_id;
-
-    // 2. Verify booth is still locked by this vendor
-    if (booth.status !== "locked" || booth.locked_by !== vendorId) {
-      return res.status(409).json({ error: "Booth lock expired. Please select your booth again." });
+      // Create vendor profile
+      await supabase.from("vendor_profiles").insert({
+        user_id: vendorId,
+        business_name: vendorBusiness || vendorName,
+        what_they_sell: vendorSelling || null,
+        source: "checkout",
+      });
     }
 
-    // 3. Calculate fees
-    const { totalCharged, stripeFee, platformFee, organizerAmount } = calculateFees(booth.price);
+    // 2. Fetch event and booth info
+    const price = boothPrice || 45;
+    const { totalCharged, stripeFee, platformFee, organizerAmount } = calculateFees(price);
     const amountInCents = Math.round(totalCharged * 100);
-    const platformFeeInCents = Math.round(platformFee * 100);
 
-    // 4. Create Stripe Payment Intent with Connect
-    const paymentIntentData = {
-      amount: amountInCents,
-      currency: "usd",
-      metadata: {
-        boothId,
-        vendorId,
-        eventId,
-        eventName: event.name,
-        boothNumber: booth.booth_number.toString(),
-        vendorEmail: vendor.email,
-      },
-      receipt_email: vendor.email,
-      description: `${event.name} — Booth #${booth.booth_number}`,
-    };
+    // 3. Generate confirmation number
+    const confirmationNumber = `EH-${Date.now().toString().slice(-5)}-${Math.floor(Math.random() * 9000 + 1000)}`;
 
-    // If organizer has connected Stripe account, use Connect to split payment
-    if (organizerStripeAccount) {
-      paymentIntentData.application_fee_amount = platformFeeInCents;
-      paymentIntentData.transfer_data = { destination: organizerStripeAccount };
-    }
-
-    const paymentIntent = await stripe.paymentIntents.create(paymentIntentData);
-
-    // 5. Create a pending booking record
-    const confirmationNumber = generateConfirmationNumber(eventId, boothId);
-    const qrData = generateQRData("pending", confirmationNumber, eventId);
-
+    // 4. Create booking record
     const { data: booking, error: bookingError } = await supabase
-      .from("bookings")
-      .insert({
+      .from("bookings").insert({
         vendor_id: vendorId,
-        booth_id: boothId,
+        booth_id: boothId || null,
         event_id: eventId,
         confirmation_number: confirmationNumber,
-        status: "pending",
+        status: "confirmed",
         amount_paid: totalCharged,
-        booth_fee: booth.price,
+        booth_fee: price,
         platform_fee: platformFee,
         stripe_fee: stripeFee,
-        stripe_payment_intent_id: paymentIntent.id,
-        qr_code_data: qrData,
-      })
-      .select()
-      .single();
+        qr_code_data: JSON.stringify({ confirmationNumber, eventId, boothNumber }),
+        vendor_notes: vendorSelling || null,
+      }).select().single();
 
     if (bookingError) throw bookingError;
 
+    // 5. Mark booth as taken if we have booth ID
+    if (boothId) {
+      await supabase.from("booths")
+        .update({ status: "taken" })
+        .eq("id", boothId);
+    }
+
     return res.status(200).json({
       success: true,
-      clientSecret: paymentIntent.client_secret,
-      bookingId: booking.id,
       confirmationNumber,
+      bookingId: booking.id,
+      vendorId,
       fees: { totalCharged, stripeFee, platformFee, organizerAmount },
     });
 
   } catch (err) {
-    console.error("Create payment intent error:", err);
-    return res.status(500).json({ error: "Failed to create payment" });
+    console.error("Create booking error:", err);
+    return res.status(500).json({ error: err.message || "Failed to create booking" });
   }
 });
 
