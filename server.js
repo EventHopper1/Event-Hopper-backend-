@@ -25,9 +25,13 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  : null; // fallback if no key
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const resend = new Resend(process.env.RESEND_API_KEY);
+const resend = process.env.RESEND_API_KEY 
+  ? new Resend(process.env.RESEND_API_KEY)
+  : { emails: { send: async () => ({ id: 'mock' }) } }; // fallback if no key
 
 const PLATFORM_FEE_PCT = parseFloat(process.env.PLATFORM_FEE_PERCENT || "5") / 100;
 const BOOTH_LOCK_MINUTES = 10;
@@ -740,8 +744,13 @@ async function sendOrganizerNotification(booking) {
 // ─────────────────────────────────────────────────────────────────
 // START SERVER
 // ─────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
+// ── Health check — Railway requires this ─────────────────────────
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok", service: "Event Hopper API" });
+});
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🦗 Event Hopper API running on port ${PORT}`);
   console.log(`   Stripe mode: ${process.env.STRIPE_SECRET_KEY?.startsWith("sk_live") ? "LIVE 🔴" : "TEST 🟡"}`);
 });
