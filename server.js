@@ -1,817 +1,595 @@
-// ─────────────────────────────────────────────────────────────────
-// EVENT HOPPER — BACKEND API
-// Node.js + Express + Stripe + Supabase
-//
-// SETUP:
-//   npm install express stripe @supabase/supabase-js resend cors dotenv
-//
-// ENV VARIABLES NEEDED (.env):
-//   STRIPE_SECRET_KEY=sk_live_...
-//   STRIPE_WEBHOOK_SECRET=whsec_...
-//   SUPABASE_URL=https://xxxx.supabase.co
-//   SUPABASE_SERVICE_KEY=eyJ...
-//   RESEND_API_KEY=re_...
-//   PLATFORM_FEE_PERCENT=5
-//   CLIENT_URL=https://yourdomain.com
-//   PORT=4000
-// ─────────────────────────────────────────────────────────────────
-
-import express from "express";
-import Stripe from "stripe";
-import { createClient } from "@supabase/supabase-js";
-import { Resend } from "resend";
-import cors from "cors";
-import dotenv from "dotenv";
-dotenv.config();
+import express from 'express';
+import cors from 'cors';
+import { createClient } from '@supabase/supabase-js';
+import bcrypt from 'bcryptjs';
 
 const app = express();
-const stripe = process.env.STRIPE_SECRET_KEY
-  ? new Stripe(process.env.STRIPE_SECRET_KEY)
-  : null; // fallback if no key
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const resend = process.env.RESEND_API_KEY 
-  ? new Resend(process.env.RESEND_API_KEY)
-  : { emails: { send: async () => ({ id: 'mock' }) } }; // fallback if no key
+const PORT = process.env.PORT || 3001;
 
-const PLATFORM_FEE_PCT = parseFloat(process.env.PLATFORM_FEE_PERCENT || "5") / 100;
-const BOOTH_LOCK_MINUTES = 10;
+// ─── Supabase ────────────────────────────────────────────────────────────────
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
 
-// ── Middleware ──
-// Stripe webhooks need raw body — must come BEFORE express.json()
-app.use("/api/webhooks/stripe", express.raw({ type: "application/json" }));
-app.use(express.json());
+// ─── Stripe (graceful if missing) ────────────────────────────────────────────
+let stripe = null;
+if (process.env.STRIPE_SECRET_KEY && process.env.STRIPE_SECRET_KEY !== 'placeholder') {
+  const Stripe = (await import('stripe')).default;
+  stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+  console.log('✅ Stripe initialized');
+} else {
+  console.log('⚠️  Stripe key not configured — payment endpoints will mock');
+}
+
+// ─── Resend (graceful if missing) ────────────────────────────────────────────
+let resend = null;
+if (process.env.RESEND_API_KEY && process.env.RESEND_API_KEY !== 'placeholder') {
+  const { Resend } = await import('resend');
+  resend = new Resend(process.env.RESEND_API_KEY);
+  console.log('✅ Resend initialized');
+} else {
+  console.log('⚠️  Resend key not configured — emails will be skipped');
+}
+
+// ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors({
   origin: [
-    process.env.CLIENT_URL,
-    "https://event-hopper-7.vercel.app",
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "http://localhost:5175",
-  ].filter(Boolean),
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+    'https://event-hopper-7.vercel.app',
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:5175',
+  ],
   credentials: true,
 }));
+app.use(express.json());
 
-// ─────────────────────────────────────────────────────────────────
-// HELPER — Calculate fee split
-// ─────────────────────────────────────────────────────────────────
-function calculateFees(boothPrice) {
-  const stripeFee = parseFloat((boothPrice * 0.029 + 0.30).toFixed(2));
-  const platformFee = parseFloat((boothPrice * PLATFORM_FEE_PCT).toFixed(2));
-  const organizerAmount = parseFloat((boothPrice - stripeFee - platformFee).toFixed(2));
-  const totalCharged = boothPrice;
-  return { totalCharged, stripeFee, platformFee, organizerAmount };
-}
+// ─── Health Check ─────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
-// ─────────────────────────────────────────────────────────────────
-// HELPER — Generate confirmation number
-// ─────────────────────────────────────────────────────────────────
-function generateConfirmationNumber(eventId, boothId) {
-  const timestamp = Date.now().toString().slice(-5);
-  const rand = Math.floor(Math.random() * 9000 + 1000);
-  return `EH-${timestamp}-${rand}`;
-}
-
-// ─────────────────────────────────────────────────────────────────
-// HELPER — Generate QR code data string
-// ─────────────────────────────────────────────────────────────────
-function generateQRData(bookingId, confirmationNumber, eventId) {
-  return JSON.stringify({ bookingId, confirmationNumber, eventId, platform: "EventHopper" });
-}
-
-// ─────────────────────────────────────────────────────────────────
-// ROUTE 0 — Find or create a guest vendor from checkout info
-// POST /api/vendors/find-or-create
-// Body: { email, fullName, businessName, phone, whatTheySell }
-//
-// Called BEFORE the booth lock — creates a guest user record
-// if one doesn't already exist for this email.
-// No password required — account_type = "guest"
-// ─────────────────────────────────────────────────────────────────
-app.post("/api/vendors/find-or-create", async (req, res) => {
-  const { email, fullName, businessName, phone, whatTheySell } = req.body;
-
-  if (!email || !fullName) {
-    return res.status(400).json({ error: "email and fullName are required" });
-  }
-
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTH — ORGANIZER SIGNUP (with password hashing)
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/api/auth/organizer-signup', async (req, res) => {
   try {
-    // 1. Check if user already exists by email
-    const { data: existingUser } = await supabase
-      .from("users")
-      .select("*, vendor_profiles(*)")
-      .eq("email", email.toLowerCase().trim())
-      .single();
+    const {
+      email, password, full_name,
+      business_name, phone, website, event_types, description,
+    } = req.body;
 
-    if (existingUser) {
-      // User exists — update their vendor profile with latest checkout info
-      await supabase.from("vendor_profiles").update({
-        business_name: businessName || existingUser.vendor_profiles?.business_name,
-        what_they_sell: whatTheySell || existingUser.vendor_profiles?.what_they_sell,
-        phone: phone || existingUser.vendor_profiles?.phone,
-        last_booked_at: new Date().toISOString(),
-      }).eq("user_id", existingUser.id);
-
-      console.log(`♻️  Returning vendor found: ${email}`);
-      return res.status(200).json({
-        success: true,
-        vendorId: existingUser.id,
-        isReturning: true,
-        message: "Welcome back! Your details have been updated.",
-      });
+    if (!email || !password || !full_name || !business_name) {
+      return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // 2. New vendor — create guest user record (no password)
+    // Check for existing user
+    const { data: existing } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', email.toLowerCase().trim())
+      .single();
+
+    if (existing) {
+      return res.status(409).json({ error: 'An account with this email already exists.' });
+    }
+
+    // Hash password
+    const password_hash = await bcrypt.hash(password, 12);
+
+    // Create user row
     const { data: newUser, error: userError } = await supabase
-      .from("users")
+      .from('users')
       .insert({
         email: email.toLowerCase().trim(),
-        full_name: fullName,
-        phone: phone || null,
-        role: "vendor",
-        account_type: "guest",       // guest = no password yet
-        password_hash: null,          // NULLABLE — no password required
-        is_verified: false,
-        is_active: true,
-        account_claimed: false,
+        password_hash,
+        full_name,
+        role: 'organizer',
+        is_active: false, // pending approval
       })
       .select()
       .single();
 
     if (userError) throw userError;
 
-    // 3. Create vendor profile from checkout data
+    // Create organizer profile
     const { error: profileError } = await supabase
-      .from("vendor_profiles")
+      .from('organizer_profiles')
       .insert({
         user_id: newUser.id,
-        business_name: businessName || null,
-        what_they_sell: whatTheySell || null,
+        business_name,
         phone: phone || null,
-        total_bookings: 0,
-        total_spent: 0,
-        source: "checkout",
-        first_booked_at: new Date().toISOString(),
-        last_booked_at: new Date().toISOString(),
+        website: website || null,
+        event_types: event_types || null,
+        description: description || null,
+        approval_status: 'pending',
       });
 
     if (profileError) throw profileError;
 
-    // 4. Generate claim token so vendor can optionally create a full account later
-    const claimToken = `claim_${newUser.id}_${Date.now()}`;
-    const claimExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(); // 7 days
+    // Notify Event Hopper team via email (if Resend configured)
+    if (resend) {
+      await resend.emails.send({
+        from: 'Event Hopper <noreply@eventhopper.com>',
+        to: 'team@eventhopper.com', // update to real team email
+        subject: `New organizer signup: ${business_name}`,
+        html: `
+          <h2>New Organizer Signup</h2>
+          <p><strong>Name:</strong> ${full_name}</p>
+          <p><strong>Business:</strong> ${business_name}</p>
+          <p><strong>Email:</strong> ${email}</p>
+          <p><strong>Phone:</strong> ${phone || 'N/A'}</p>
+          <p><strong>Website:</strong> ${website || 'N/A'}</p>
+          <p><strong>Event Types:</strong> ${event_types || 'N/A'}</p>
+          <p><strong>Description:</strong> ${description || 'N/A'}</p>
+          <p><a href="https://event-hopper-7.vercel.app/admin">Go to Admin Portal to approve →</a></p>
+        `,
+      }).catch(e => console.error('Email send error:', e));
+    }
 
-    await supabase.from("users").update({
-      claim_token: claimToken,
-      claim_token_expires: claimExpiry,
-    }).eq("id", newUser.id);
-
-    console.log(`✅ New guest vendor created: ${email}`);
-    return res.status(201).json({
-      success: true,
-      vendorId: newUser.id,
-      isReturning: false,
-      claimToken, // Included in confirmation email so vendor can optionally claim account
-      message: "Guest vendor account created from checkout.",
-    });
-
+    res.json({ success: true, message: 'Application received! We\'ll review and reach out within 24 hours.' });
   } catch (err) {
-    console.error("Find or create vendor error:", err);
-    return res.status(500).json({ error: "Failed to create vendor record" });
+    console.error('Organizer signup error:', err);
+    res.status(500).json({ error: err.message || 'Signup failed' });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────
-// ROUTE 0b — Claim a guest account (set password)
-// POST /api/vendors/claim-account
-// Body: { claimToken, password }
-// Called when vendor clicks "Create Account" on confirmation page
-// ─────────────────────────────────────────────────────────────────
-app.post("/api/vendors/claim-account", async (req, res) => {
-  const { claimToken, password } = req.body;
-
-  if (!claimToken || !password) {
-    return res.status(400).json({ error: "claimToken and password are required" });
-  }
-
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTH — ORGANIZER LOGIN (with bcrypt password verification)
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/api/auth/organizer-login', async (req, res) => {
   try {
-    // 1. Find user by claim token
-    const { data: user, error } = await supabase
-      .from("users")
-      .select("*")
-      .eq("claim_token", claimToken)
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required.' });
+    }
+
+    // Fetch user + organizer profile
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select(`
+        id, email, full_name, role, is_active, password_hash,
+        organizer_profiles (
+          id, business_name, approval_status, phone, website, event_types, description
+        )
+      `)
+      .eq('email', email.toLowerCase().trim())
+      .eq('role', 'organizer')
       .single();
 
-    if (error || !user) {
-      return res.status(404).json({ error: "Invalid or expired claim token" });
+    if (userError || !user) {
+      return res.status(401).json({ error: 'No organizer account found with that email.' });
     }
 
-    // 2. Check token hasn't expired
-    if (new Date(user.claim_token_expires) < new Date()) {
-      return res.status(400).json({ error: "Claim token has expired. Please contact support." });
+    // Verify password
+    if (!user.password_hash) {
+      // Legacy: account created before password hashing — force reset
+      return res.status(401).json({ error: 'Please reset your password. Contact support@eventhopper.com' });
     }
 
-    // 3. Set password via Supabase Auth and upgrade to registered account
-    // In production: hash password and update auth.users via Supabase admin client
-    // const passwordHash = await bcrypt.hash(password, 10);
+    const passwordMatch = await bcrypt.compare(password, user.password_hash);
+    if (!passwordMatch) {
+      return res.status(401).json({ error: 'Incorrect password.' });
+    }
 
-    await supabase.from("users").update({
-      account_type: "registered",
-      account_claimed: true,
-      is_verified: true,
-      claim_token: null,
-      claim_token_expires: null,
-    }).eq("id", user.id);
+    // Check approval
+    const profile = user.organizer_profiles?.[0];
+    if (!profile || profile.approval_status === 'pending') {
+      return res.status(403).json({
+        error: 'Your account is pending approval. We\'ll email you once it\'s reviewed.',
+        approval_status: 'pending',
+      });
+    }
 
-    console.log(`🎉 Guest account claimed: ${user.email}`);
-    return res.status(200).json({
+    if (profile.approval_status === 'rejected') {
+      return res.status(403).json({
+        error: 'Your application was not approved. Contact support@eventhopper.com for more info.',
+        approval_status: 'rejected',
+      });
+    }
+
+    if (!user.is_active) {
+      return res.status(403).json({ error: 'Account is inactive. Contact support.' });
+    }
+
+    // Return safe user object (no password hash)
+    res.json({
       success: true,
-      message: "Account created successfully! You can now log in.",
-      email: user.email,
+      user: {
+        id: user.id,
+        email: user.email,
+        full_name: user.full_name,
+        role: user.role,
+        organizer_profile: profile,
+      },
     });
-
   } catch (err) {
-    console.error("Claim account error:", err);
-    return res.status(500).json({ error: "Failed to claim account" });
+    console.error('Organizer login error:', err);
+    res.status(500).json({ error: 'Login failed' });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────
-// ROUTE 1 — Lock a booth during checkout
-// POST /api/bookings/lock
-// Body: { boothId, vendorId }
-// ─────────────────────────────────────────────────────────────────
-app.post("/api/bookings/lock", async (req, res) => {
-  const { boothId, vendorId } = req.body;
-
-  if (!boothId || !vendorId) {
-    return res.status(400).json({ error: "boothId and vendorId are required" });
-  }
-
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN — GET PENDING ORGANIZERS
+// ═══════════════════════════════════════════════════════════════════════════════
+app.get('/api/admin/organizers', async (req, res) => {
   try {
-    // 1. Fetch the booth
-    const { data: booth, error: fetchError } = await supabase
-      .from("booths")
-      .select("*")
-      .eq("id", boothId)
-      .single();
+    const { status } = req.query; // 'pending' | 'approved' | 'rejected' | 'all'
 
-    if (fetchError || !booth) {
-      return res.status(404).json({ error: "Booth not found" });
+    let query = supabase
+      .from('organizer_profiles')
+      .select(`
+        id, business_name, phone, website, event_types, description, approval_status, created_at,
+        users ( id, email, full_name, is_active, created_at )
+      `)
+      .order('created_at', { ascending: false });
+
+    if (status && status !== 'all') {
+      query = query.eq('approval_status', status);
     }
 
-    // 2. Check if booth is available
-    if (booth.status === "taken") {
-      return res.status(409).json({ error: "This booth has already been booked" });
+    const { data, error } = await query;
+    if (error) throw error;
+
+    res.json({ organizers: data });
+  } catch (err) {
+    console.error('Get organizers error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN — APPROVE / REJECT ORGANIZER
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/api/admin/organizers/:userId/approve', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { action, note } = req.body; // action: 'approve' | 'reject'
+
+    if (!['approve', 'reject'].includes(action)) {
+      return res.status(400).json({ error: 'Action must be approve or reject' });
     }
 
-    // 3. Check if booth is locked by someone else
-    if (booth.status === "locked" && booth.locked_by !== vendorId) {
-      const lockExpiry = new Date(booth.locked_until);
-      if (lockExpiry > new Date()) {
-        const minutesLeft = Math.ceil((lockExpiry - new Date()) / 60000);
-        return res.status(409).json({
-          error: `This booth is currently being reserved by another vendor. Try again in ${minutesLeft} minute(s).`,
-        });
+    const approval_status = action === 'approve' ? 'approved' : 'rejected';
+    const is_active = action === 'approve';
+
+    // Update organizer_profiles
+    const { error: profileError } = await supabase
+      .from('organizer_profiles')
+      .update({ approval_status })
+      .eq('user_id', userId);
+
+    if (profileError) throw profileError;
+
+    // Update users table
+    const { error: userError } = await supabase
+      .from('users')
+      .update({ is_active })
+      .eq('id', userId);
+
+    if (userError) throw userError;
+
+    // Send email to organizer (if Resend configured)
+    if (resend) {
+      const { data: userData } = await supabase
+        .from('users')
+        .select('email, full_name, organizer_profiles(business_name)')
+        .eq('id', userId)
+        .single();
+
+      if (userData) {
+        const subject = action === 'approve'
+          ? `You're approved! Welcome to Event Hopper 🦗`
+          : `Event Hopper Application Update`;
+
+        const html = action === 'approve'
+          ? `
+            <h2>You're approved, ${userData.full_name}!</h2>
+            <p>Your Event Hopper organizer account is ready. You can now log in and start creating events.</p>
+            <p><a href="https://event-hopper-7.vercel.app">Log in to Event Hopper →</a></p>
+          `
+          : `
+            <h2>Application Update</h2>
+            <p>Hi ${userData.full_name}, unfortunately we're not able to approve your application at this time.</p>
+            ${note ? `<p>Note: ${note}</p>` : ''}
+            <p>Questions? Reply to this email or contact support@eventhopper.com</p>
+          `;
+
+        await resend.emails.send({
+          from: 'Event Hopper <noreply@eventhopper.com>',
+          to: userData.email,
+          subject,
+          html,
+        }).catch(e => console.error('Email send error:', e));
       }
     }
 
-    // 4. Lock the booth for BOOTH_LOCK_MINUTES
-    const lockedUntil = new Date(Date.now() + BOOTH_LOCK_MINUTES * 60 * 1000).toISOString();
-
-    const { error: lockError } = await supabase
-      .from("booths")
-      .update({ status: "locked", locked_by: vendorId, locked_until: lockedUntil })
-      .eq("id", boothId);
-
-    if (lockError) throw lockError;
-
-    return res.status(200).json({
-      success: true,
-      message: "Booth locked successfully",
-      lockedUntil,
-      lockDurationMinutes: BOOTH_LOCK_MINUTES,
-      booth: { id: booth.id, booth_number: booth.booth_number, price: booth.price, tier: booth.tier },
-    });
-
+    res.json({ success: true, action, userId });
   } catch (err) {
-    console.error("Lock booth error:", err);
-    return res.status(500).json({ error: "Failed to lock booth" });
+    console.error('Organizer approval error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────
-// ROUTE 2 — Create Stripe Payment Intent
-// POST /api/payments/create-intent
-// Body: { eventId, boothId, boothNumber, boothPrice, vendorName, vendorEmail, vendorBusiness, vendorPhone, vendorSelling }
-// ─────────────────────────────────────────────────────────────────
-app.post("/api/payments/create-intent", async (req, res) => {
-  const { eventId, boothId, boothNumber, boothPrice, vendorName, vendorEmail, vendorBusiness, vendorPhone, vendorSelling } = req.body;
-
-  if (!eventId || !vendorEmail || !vendorName) {
-    return res.status(400).json({ error: "eventId, vendorEmail, and vendorName are required" });
-  }
-
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORGANIZER — CREATE EVENT (tied to organizer_id)
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/api/events/create', async (req, res) => {
   try {
-    // 1. Find or create guest vendor user
+    const {
+      organizer_user_id,
+      name, description, date, end_date,
+      location, address, city, state,
+      event_type, expected_vendors,
+      is_recurring, recurrence_type, recurrence_count,
+      image_url,
+    } = req.body;
+
+    if (!organizer_user_id || !name || !date) {
+      return res.status(400).json({ error: 'Missing required fields: organizer_user_id, name, date' });
+    }
+
+    // Verify organizer is approved
+    const { data: profile, error: profileError } = await supabase
+      .from('organizer_profiles')
+      .select('id, business_name, approval_status')
+      .eq('user_id', organizer_user_id)
+      .single();
+
+    if (profileError || !profile) {
+      return res.status(403).json({ error: 'Organizer profile not found' });
+    }
+
+    if (profile.approval_status !== 'approved') {
+      return res.status(403).json({ error: 'Organizer not approved' });
+    }
+
+    const eventsToCreate = [];
+
+    if (is_recurring && recurrence_type && recurrence_count > 1) {
+      // Create multiple dated events
+      const baseDate = new Date(date);
+      const intervalDays = recurrence_type === 'weekly' ? 7 : 14;
+
+      for (let i = 0; i < recurrence_count; i++) {
+        const eventDate = new Date(baseDate);
+        eventDate.setDate(baseDate.getDate() + i * intervalDays);
+
+        eventsToCreate.push({
+          organizer_id: organizer_user_id,
+          name: `${name}${i > 0 ? ` (${eventDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })})` : ''}`,
+          description: description || null,
+          date: eventDate.toISOString().split('T')[0],
+          end_date: end_date || null,
+          location: location || null,
+          address: address || null,
+          city: city || null,
+          state: state || null,
+          event_type: event_type || 'flea_market',
+          expected_vendors: expected_vendors || null,
+          image_url: image_url || null,
+          status: 'draft',
+          recurrence_group: `${organizer_user_id}-${Date.now()}`,
+        });
+      }
+    } else {
+      eventsToCreate.push({
+        organizer_id: organizer_user_id,
+        name,
+        description: description || null,
+        date,
+        end_date: end_date || null,
+        location: location || null,
+        address: address || null,
+        city: city || null,
+        state: state || null,
+        event_type: event_type || 'flea_market',
+        expected_vendors: expected_vendors || null,
+        image_url: image_url || null,
+        status: 'draft',
+      });
+    }
+
+    const { data: createdEvents, error: eventError } = await supabase
+      .from('events')
+      .insert(eventsToCreate)
+      .select();
+
+    if (eventError) throw eventError;
+
+    res.json({ success: true, events: createdEvents });
+  } catch (err) {
+    console.error('Create event error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORGANIZER — GET MY EVENTS (with booth counts)
+// ═══════════════════════════════════════════════════════════════════════════════
+app.get('/api/events/organizer/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const { data: events, error } = await supabase
+      .from('events')
+      .select(`
+        id, name, date, status, event_type, location, address, city, state, description,
+        created_at,
+        booths ( id, status, tier, price )
+      `)
+      .eq('organizer_id', userId)
+      .order('date', { ascending: true });
+
+    if (error) throw error;
+
+    // Enrich with booth stats
+    const enriched = events.map(event => ({
+      ...event,
+      booth_count: event.booths?.length || 0,
+      booths_available: event.booths?.filter(b => b.status === 'available').length || 0,
+      booths_taken: event.booths?.filter(b => b.status === 'taken').length || 0,
+    }));
+
+    res.json({ events: enriched });
+  } catch (err) {
+    console.error('Get organizer events error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PAYMENTS — Create booking + Stripe PaymentIntent
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/api/payments/create-intent', async (req, res) => {
+  try {
+    const { booth_id, vendor_info, event_id } = req.body;
+
+    // Verify booth is available
+    const { data: booth, error: boothError } = await supabase
+      .from('booths')
+      .select('id, price, status, tier, event_id')
+      .eq('id', booth_id)
+      .single();
+
+    if (boothError || !booth) {
+      return res.status(404).json({ error: 'Booth not found' });
+    }
+
+    if (booth.status === 'taken') {
+      return res.status(409).json({ error: 'This booth was just booked by someone else. Please choose another.' });
+    }
+
+    const amount = Math.round((booth.price || 45) * 100); // cents
+    const platformFeePercent = parseFloat(process.env.PLATFORM_FEE_PERCENT || '5') / 100;
+    const platformFee = Math.round(amount * platformFeePercent);
+
+    // Upsert vendor in users table
     let vendorId;
     const { data: existingUser } = await supabase
-      .from("users").select("id").eq("email", vendorEmail).single();
+      .from('users')
+      .select('id')
+      .eq('email', vendor_info.email.toLowerCase().trim())
+      .maybeSingle();
 
     if (existingUser) {
       vendorId = existingUser.id;
     } else {
-      const { data: newUser, error: userErr } = await supabase
-        .from("users").insert({
-          email: vendorEmail,
-          full_name: vendorName,
-          phone: vendorPhone || null,
-          role: "vendor",
-          account_type: "guest",
+      const { data: newVendor, error: vendorError } = await supabase
+        .from('users')
+        .insert({
+          email: vendor_info.email.toLowerCase().trim(),
+          full_name: vendor_info.name,
+          role: 'vendor',
           is_active: true,
-        }).select().single();
-      if (userErr) throw userErr;
-      vendorId = newUser.id;
+        })
+        .select()
+        .single();
 
-      // Create vendor profile
-      await supabase.from("vendor_profiles").insert({
+      if (vendorError) throw vendorError;
+      vendorId = newVendor.id;
+    }
+
+    // Upsert vendor_profile
+    await supabase
+      .from('vendor_profiles')
+      .upsert({
         user_id: vendorId,
-        business_name: vendorBusiness || vendorName,
-        what_they_sell: vendorSelling || null,
-        source: "checkout",
-      });
-    }
+        business_name: vendor_info.business_name || vendor_info.name,
+        phone: vendor_info.phone || null,
+        what_selling: vendor_info.what_selling || null,
+      }, { onConflict: 'user_id' });
 
-    // 2. Fetch event and booth info
-    const price = boothPrice || 45;
-    const { totalCharged, stripeFee, platformFee, organizerAmount } = calculateFees(price);
-    const amountInCents = Math.round(totalCharged * 100);
+    // Generate confirmation number
+    const confirmationNumber = `EH-${Math.random().toString(36).substring(2, 7).toUpperCase()}-${Math.floor(Math.random() * 9000 + 1000)}`;
 
-    // 3. Generate confirmation number
-    const confirmationNumber = `EH-${Date.now().toString().slice(-5)}-${Math.floor(Math.random() * 9000 + 1000)}`;
-
-    // 4. Create Stripe charge if Stripe is configured
-    let stripePaymentIntentId = null;
-    if (stripe) {
-      try {
-        const paymentIntent = await stripe.paymentIntents.create({
-          amount: Math.round(totalCharged * 100),
-          currency: "usd",
-          payment_method_types: ["card"],
-          metadata: {
-            confirmationNumber,
-            eventId,
-            vendorEmail,
-            boothNumber: boothNumber?.toString() || "",
-          },
-          receipt_email: vendorEmail,
-          description: `Event Hopper — Booth #${boothNumber}`,
-          confirm: false,
-        });
-        stripePaymentIntentId = paymentIntent.id;
-      } catch (stripeErr) {
-        console.log("Stripe charge skipped:", stripeErr.message);
-      }
-    }
-
-    // 5. Create booking record
+    // Create booking
     const { data: booking, error: bookingError } = await supabase
-      .from("bookings").insert({
+      .from('bookings')
+      .insert({
         vendor_id: vendorId,
-        booth_id: boothId || null,
-        event_id: eventId,
+        booth_id,
+        event_id: event_id || booth.event_id,
+        status: 'confirmed',
+        amount_paid: booth.price,
+        platform_fee: platformFee / 100,
         confirmation_number: confirmationNumber,
-        status: "confirmed",
-        amount_paid: totalCharged,
-        booth_fee: price,
-        platform_fee: platformFee,
-        stripe_fee: stripeFee,
-        stripe_payment_intent_id: stripePaymentIntentId,
-        qr_code_data: JSON.stringify({ confirmationNumber, eventId, boothNumber }),
-        vendor_notes: vendorSelling || null,
-      }).select().single();
+        vendor_name: vendor_info.name,
+        vendor_email: vendor_info.email,
+        vendor_phone: vendor_info.phone || null,
+        business_name: vendor_info.business_name || null,
+        what_selling: vendor_info.what_selling || null,
+      })
+      .select()
+      .single();
 
     if (bookingError) throw bookingError;
 
-    // 5. Mark booth as taken — try UUID first, then booth_number
-    let bookedBoothDbId = null;
-    if (boothId) {
-      // Try UUID first
-      const { data: boothByUUID, error: uuidErr } = await supabase.from("booths")
-        .update({ status: "taken", locked_by: null, locked_until: null })
-        .eq("id", boothId)
-        .eq("event_id", eventId)
-        .select("id").single();
+    // Mark booth as taken
+    await supabase
+      .from('booths')
+      .update({ status: 'taken' })
+      .eq('id', booth_id);
 
-      if (!uuidErr && boothByUUID) {
-        bookedBoothDbId = boothByUUID.id;
-        console.log("✅ Booth marked taken by UUID:", boothId);
-      }
+    // Create Stripe PaymentIntent (if configured)
+    let clientSecret = null;
+    if (stripe) {
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount,
+        currency: 'usd',
+        metadata: {
+          booking_id: booking.id,
+          confirmation_number: confirmationNumber,
+          vendor_email: vendor_info.email,
+          booth_id,
+          event_id: event_id || booth.event_id,
+          platform_fee: platformFee,
+        },
+      });
+      clientSecret = paymentIntent.client_secret;
+
+      // Record in payments table
+      await supabase.from('payments').insert({
+        booking_id: booking.id,
+        stripe_payment_intent_id: paymentIntent.id,
+        amount: booth.price,
+        platform_fee: platformFee / 100,
+        status: 'pending',
+      });
     }
 
-    // Try booth_number if UUID didn't work
-    if (!bookedBoothDbId && boothNumber) {
-      const { data: boothByNum, error: numErr } = await supabase.from("booths")
-        .update({ status: "taken" })
-        .eq("booth_number", parseInt(boothNumber))
-        .eq("event_id", eventId)
-        .select("id").single();
-
-      if (!numErr && boothByNum) {
-        bookedBoothDbId = boothByNum.id;
-        console.log("✅ Booth marked taken by booth_number:", boothNumber);
-      } else {
-        console.log("⚠️ Could not mark booth taken. boothId:", boothId, "boothNumber:", boothNumber);
-      }
+    // Send vendor confirmation email (if Resend configured)
+    if (resend) {
+      await resend.emails.send({
+        from: 'Event Hopper <noreply@eventhopper.com>',
+        to: vendor_info.email,
+        subject: `Booking Confirmed! ${confirmationNumber}`,
+        html: `
+          <h2>You're booked! 🎉</h2>
+          <p>Hi ${vendor_info.name},</p>
+          <p>Your booth has been confirmed.</p>
+          <p><strong>Confirmation #:</strong> ${confirmationNumber}</p>
+          <p><strong>Amount:</strong> $${booth.price}</p>
+          <p>See you at the market!</p>
+          <p>— The Event Hopper Team</p>
+        `,
+      }).catch(e => console.error('Email error:', e));
     }
 
-    // Update booking with booth_id if we found it
-    if (bookedBoothDbId) {
-      await supabase.from("bookings")
-        .update({ booth_id: bookedBoothDbId })
-        .eq("confirmation_number", confirmationNumber);
-    }
-    
-    console.log("✅ Booking created:", confirmationNumber, "for", vendorEmail);
-
-    return res.status(200).json({
+    res.json({
       success: true,
+      clientSecret,
       confirmationNumber,
-      bookingId: booking.id,
-      vendorId,
-      fees: { totalCharged, stripeFee, platformFee, organizerAmount },
+      booking,
     });
-
   } catch (err) {
-    console.error("Create booking error:", err);
-    return res.status(500).json({ error: err.message || "Failed to create booking" });
+    console.error('Payment error:', err);
+    res.status(500).json({ error: err.message || 'Booking failed' });
   }
 });
 
-// ─────────────────────────────────────────────────────────────────
-// ROUTE 3 — Confirm booking after successful payment
-// POST /api/payments/confirm
-// Body: { paymentIntentId, bookingId }
-// ─────────────────────────────────────────────────────────────────
-app.post("/api/payments/confirm", async (req, res) => {
-  const { paymentIntentId, bookingId } = req.body;
-
-  try {
-    // 1. Verify payment with Stripe
-    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
-
-    if (paymentIntent.status !== "succeeded") {
-      return res.status(400).json({ error: "Payment has not succeeded" });
-    }
-
-    // 2. Fetch booking
-    const { data: booking, error: bookingFetchError } = await supabase
-      .from("bookings")
-      .select("*, booths(*), events(*), users!vendor_id(*)")
-      .eq("id", bookingId)
-      .single();
-
-    if (bookingFetchError || !booking) {
-      return res.status(404).json({ error: "Booking not found" });
-    }
-
-    // 3. Update booking to confirmed
-    const { error: bookingUpdateError } = await supabase
-      .from("bookings")
-      .update({ status: "confirmed" })
-      .eq("id", bookingId);
-
-    if (bookingUpdateError) throw bookingUpdateError;
-
-    // 4. Mark booth as taken
-    const { error: boothUpdateError } = await supabase
-      .from("booths")
-      .update({ status: "taken", locked_by: null, locked_until: null })
-      .eq("id", booking.booth_id);
-
-    if (boothUpdateError) throw boothUpdateError;
-
-    // 5. Create payment ledger record
-    const { error: paymentError } = await supabase
-      .from("payments")
-      .insert({
-        booking_id: bookingId,
-        stripe_payment_intent_id: paymentIntentId,
-        amount_total: booking.amount_paid,
-        amount_organizer: booking.amount_paid - booking.platform_fee - booking.stripe_fee,
-        amount_platform: booking.platform_fee,
-        amount_stripe: booking.stripe_fee,
-        currency: "usd",
-        status: "succeeded",
-        paid_at: new Date().toISOString(),
-      });
-
-    if (paymentError) throw paymentError;
-
-    // 6. Send confirmation email to vendor
-    await sendVendorConfirmationEmail(booking);
-
-    // 7. Send notification to organizer
-    await sendOrganizerNotification(booking);
-
-    return res.status(200).json({
-      success: true,
-      booking: {
-        id: bookingId,
-        confirmationNumber: booking.confirmation_number,
-        boothNumber: booking.booths.booth_number,
-        eventName: booking.events.name,
-        amountPaid: booking.amount_paid,
-        qrCodeData: booking.qr_code_data,
-      },
-    });
-
-  } catch (err) {
-    console.error("Confirm booking error:", err);
-    return res.status(500).json({ error: "Failed to confirm booking" });
-  }
+// ─── Start server ─────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`🦗 Event Hopper backend running on port ${PORT}`);
 });
-
-// ─────────────────────────────────────────────────────────────────
-// ROUTE 4 — Stripe Webhook (payment events from Stripe)
-// POST /api/webhooks/stripe
-// ─────────────────────────────────────────────────────────────────
-app.post("/api/webhooks/stripe", async (req, res) => {
-  const sig = req.headers["stripe-signature"];
-  let event;
-
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error("Webhook signature verification failed:", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  try {
-    switch (event.type) {
-
-      // ── Payment succeeded ──
-      case "payment_intent.succeeded": {
-        const pi = event.data.object;
-        const { boothId, vendorId, eventId } = pi.metadata;
-        console.log(`✅ Payment succeeded for booth ${boothId} by vendor ${vendorId}`);
-
-        // Update booth status as backup (in case /confirm wasn't called)
-        await supabase.from("booths").update({ status: "taken", locked_by: null, locked_until: null }).eq("id", boothId);
-        await supabase.from("bookings").update({ status: "confirmed" }).eq("stripe_payment_intent_id", pi.id);
-
-        break;
-      }
-
-      // ── Payment failed ──
-      case "payment_intent.payment_failed": {
-        const pi = event.data.object;
-        const { boothId } = pi.metadata;
-        console.log(`❌ Payment failed for booth ${boothId}`);
-
-        // Release the booth lock so others can book it
-        await supabase.from("booths").update({ status: "available", locked_by: null, locked_until: null }).eq("id", boothId);
-        await supabase.from("bookings").update({ status: "cancelled" }).eq("stripe_payment_intent_id", pi.id);
-
-        break;
-      }
-
-      // ── Refund issued ──
-      case "charge.refunded": {
-        const charge = event.data.object;
-        console.log(`💸 Refund issued for charge ${charge.id}`);
-
-        await supabase.from("bookings")
-          .update({ status: "refunded", refunded_at: new Date().toISOString() })
-          .eq("stripe_payment_intent_id", charge.payment_intent);
-
-        // Release the booth back to available
-        const { data: booking } = await supabase.from("bookings")
-          .select("booth_id").eq("stripe_payment_intent_id", charge.payment_intent).single();
-
-        if (booking) {
-          await supabase.from("booths").update({ status: "available" }).eq("id", booking.booth_id);
-        }
-
-        break;
-      }
-
-      default:
-        console.log(`Unhandled Stripe event: ${event.type}`);
-    }
-
-    return res.status(200).json({ received: true });
-
-  } catch (err) {
-    console.error("Webhook processing error:", err);
-    return res.status(500).json({ error: "Webhook processing failed" });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────
-// ROUTE 5 — Get booking details
-// GET /api/bookings/:id
-// ─────────────────────────────────────────────────────────────────
-app.get("/api/bookings/:id", async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    const { data: booking, error } = await supabase
-      .from("bookings")
-      .select("*, booths(*), events(*), users!vendor_id(*, vendor_profiles(*))")
-      .eq("id", id)
-      .single();
-
-    if (error || !booking) return res.status(404).json({ error: "Booking not found" });
-
-    return res.status(200).json({ booking });
-
-  } catch (err) {
-    console.error("Get booking error:", err);
-    return res.status(500).json({ error: "Failed to fetch booking" });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────
-// ROUTE 6 — Release expired booth locks (called by cron job)
-// POST /api/booths/release-locks
-// ─────────────────────────────────────────────────────────────────
-app.post("/api/booths/release-locks", async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("booths")
-      .update({ status: "available", locked_by: null, locked_until: null })
-      .eq("status", "locked")
-      .lt("locked_until", new Date().toISOString());
-
-    if (error) throw error;
-
-    console.log(`🔓 Released expired locks`);
-    return res.status(200).json({ success: true, message: "Expired locks released" });
-
-  } catch (err) {
-    console.error("Release locks error:", err);
-    return res.status(500).json({ error: "Failed to release locks" });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────
-// ROUTE 7 — Day-of QR check-in
-// POST /api/bookings/checkin
-// Body: { qrData, organizerId }
-// ─────────────────────────────────────────────────────────────────
-app.post("/api/bookings/checkin", async (req, res) => {
-  const { qrData, organizerId } = req.body;
-
-  try {
-    const parsed = JSON.parse(qrData);
-    const { confirmationNumber } = parsed;
-
-    // Fetch booking
-    const { data: booking, error } = await supabase
-      .from("bookings")
-      .select("*, events(*), booths(*), users!vendor_id(*)")
-      .eq("confirmation_number", confirmationNumber)
-      .single();
-
-    if (error || !booking) {
-      return res.status(404).json({ error: "Booking not found", valid: false });
-    }
-
-    if (booking.status !== "confirmed") {
-      return res.status(400).json({ error: "Booking is not confirmed", valid: false, status: booking.status });
-    }
-
-    if (booking.checked_in) {
-      return res.status(200).json({
-        valid: true,
-        alreadyCheckedIn: true,
-        message: "Vendor already checked in",
-        checkedInAt: booking.checked_in_at,
-        booth: booking.booths,
-        vendor: booking.users,
-      });
-    }
-
-    // Mark as checked in
-    await supabase.from("bookings").update({ checked_in: true, checked_in_at: new Date().toISOString() }).eq("id", booking.id);
-
-    return res.status(200).json({
-      valid: true,
-      alreadyCheckedIn: false,
-      message: "✅ Vendor checked in successfully",
-      booth: { number: booking.booths.booth_number, tier: booking.booths.tier, zone: booking.booths.zone_label },
-      vendor: { name: booking.users.full_name, businessName: booking.users.vendor_profiles?.business_name, selling: booking.vendor_notes },
-      event: { name: booking.events.name, date: booking.events.date },
-    });
-
-  } catch (err) {
-    console.error("Check-in error:", err);
-    return res.status(500).json({ error: "Check-in failed", valid: false });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────
-// EMAIL HELPERS
-// ─────────────────────────────────────────────────────────────────
-async function sendVendorConfirmationEmail(booking) {
-  try {
-    await resend.emails.send({
-      from: "Event Hopper <noreply@eventhopper.com>",
-      to: booking.users.email,
-      subject: `✅ Booth #${booking.booths.booth_number} Confirmed — ${booking.events.name}`,
-      html: `
-        <div style="font-family: Georgia, serif; max-width: 560px; margin: 0 auto; background: #fff; border: 2px solid #1a1a2e; border-radius: 12px; overflow: hidden;">
-          <div style="background: #2E8BC0; padding: 28px 32px;">
-            <h1 style="color: #F9D923; margin: 0; font-size: 28px;">🦗 Event Hopper</h1>
-            <p style="color: rgba(255,255,255,0.85); margin: 8px 0 0; font-family: 'Courier New', monospace; font-size: 13px;">You're booked!</p>
-          </div>
-          <div style="padding: 32px;">
-            <h2 style="font-size: 22px; color: #1a1a2e; margin: 0 0 6px;">${booking.events.name}</h2>
-            <p style="font-family: 'Courier New', monospace; font-size: 12px; color: #6b7280; margin: 0 0 24px;">${booking.events.date} · ${booking.events.start_time} – ${booking.events.end_time}</p>
-
-            <div style="background: #f8f8f8; border-radius: 10px; padding: 18px; margin-bottom: 20px;">
-              <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
-                <span style="font-family: 'Courier New', monospace; font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 1px;">Confirmation</span>
-                <span style="font-family: 'Courier New', monospace; font-size: 12px; font-weight: 700; color: #1a1a2e;">${booking.confirmation_number}</span>
-              </div>
-              <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
-                <span style="font-family: 'Courier New', monospace; font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 1px;">Booth</span>
-                <span style="font-family: 'Courier New', monospace; font-size: 12px; font-weight: 700; color: #1a1a2e;">#${booking.booths.booth_number} · ${booking.booths.tier} · 10×10 ft</span>
-              </div>
-              <div style="display: flex; justify-content: space-between;">
-                <span style="font-family: 'Courier New', monospace; font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 1px;">Amount Paid</span>
-                <span style="font-family: 'Courier New', monospace; font-size: 14px; font-weight: 800; color: #27ae60;">$${booking.amount_paid.toFixed(2)}</span>
-              </div>
-            </div>
-
-            <div style="border-top: 1px solid rgba(0,0,0,0.08); padding-top: 20px;">
-              <p style="font-family: 'Courier New', monospace; font-size: 12px; color: #555; margin: 0 0 6px;">📍 ${booking.events.address}</p>
-              <p style="font-family: 'Courier New', monospace; font-size: 12px; color: #555; margin: 0;">Show your QR code at check-in on the day of the event.</p>
-            </div>
-          </div>
-        </div>
-      `,
-    });
-    console.log(`📧 Confirmation email sent to ${booking.users.email}`);
-  } catch (err) {
-    console.error("Email send error:", err);
-  }
-}
-
-async function sendOrganizerNotification(booking) {
-  try {
-    // Get organizer email
-    const { data: organizer } = await supabase
-      .from("users")
-      .select("email, full_name")
-      .eq("id", booking.events.organizer_id)
-      .single();
-
-    if (!organizer) return;
-
-    await resend.emails.send({
-      from: "Event Hopper <noreply@eventhopper.com>",
-      to: organizer.email,
-      subject: `🎉 New Booking — Booth #${booking.booths.booth_number} · ${booking.events.name}`,
-      html: `
-        <div style="font-family: Georgia, serif; max-width: 520px; margin: 0 auto;">
-          <div style="background: #F9D923; padding: 20px 28px; border-radius: 12px 12px 0 0; border: 2px solid #1a1a2e;">
-            <h2 style="margin: 0; color: #1a1a2e;">🎉 New Booth Booked!</h2>
-          </div>
-          <div style="background: #fff; padding: 24px 28px; border: 2px solid #1a1a2e; border-top: none; border-radius: 0 0 12px 12px;">
-            <p style="font-family: 'Courier New', monospace; font-size: 13px; color: #333;">
-              <strong>${booking.users.full_name}</strong> just booked <strong>Booth #${booking.booths.booth_number}</strong> for <strong>${booking.events.name}</strong>.
-            </p>
-            <div style="background: #f0fff4; border: 1px solid #27ae60; border-radius: 8px; padding: 14px; margin-top: 14px;">
-              <p style="font-family: 'Courier New', monospace; font-size: 12px; color: #27ae60; margin: 0; font-weight: 700;">
-                💰 $${(booking.amount_paid - booking.platform_fee - booking.stripe_fee).toFixed(2)} will be deposited to your account.
-              </p>
-            </div>
-          </div>
-        </div>
-      `,
-    });
-    console.log(`📧 Organizer notification sent to ${organizer.email}`);
-  } catch (err) {
-    console.error("Organizer notification error:", err);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────
-// START SERVER
-// ─────────────────────────────────────────────────────────────────
-// ── Health check — Railway requires this ─────────────────────────
-app.get("/health", (req, res) => {
-  res.status(200).json({ status: "ok", service: "Event Hopper API" });
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🦗 Event Hopper API running on port ${PORT}`);
-  console.log(`   Stripe mode: ${process.env.STRIPE_SECRET_KEY?.startsWith("sk_live") ? "LIVE 🔴" : "TEST 🟡"}`);
-});
-
-export default app;
