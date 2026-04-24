@@ -221,7 +221,7 @@ app.get('/api/admin/organizers', async (req, res) => {
       .from('organizer_profiles')
       .select(`
         id, business_name, phone, website, event_types, description, approval_status, created_at,
-        users ( id, email, full_name, is_active, created_at )
+        users!organizer_profiles_user_id_fkey ( id, email, full_name, is_active, created_at )
       `)
       .order('created_at', { ascending: false });
 
