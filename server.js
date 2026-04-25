@@ -85,7 +85,7 @@ app.post('/api/auth/organizer-signup', async (req, res) => {
         password_hash,
         full_name,
         role: 'organizer',
-        is_active: false, // pending approval
+        is_active: true, // auto-approved for MVP
       })
       .select()
       .single();
@@ -102,7 +102,7 @@ app.post('/api/auth/organizer-signup', async (req, res) => {
         website: website || null,
         event_types: event_types || null,
         description: description || null,
-        approval_status: 'pending',
+        approval_status: 'approved',  // auto-approve for MVP
       });
 
     if (profileError) throw profileError;
@@ -173,13 +173,10 @@ app.post('/api/auth/organizer-login', async (req, res) => {
       return res.status(401).json({ error: 'Incorrect password.' });
     }
 
-    // Check approval
+    // Check approval — skip pending check since all new accounts are auto-approved
     const profile = user.organizer_profiles?.[0];
-    if (!profile || profile.approval_status === 'pending') {
-      return res.status(403).json({
-        error: 'Your account is pending approval. We\'ll email you once it\'s reviewed.',
-        approval_status: 'pending',
-      });
+    if (!profile) {
+      return res.status(403).json({ error: 'Organizer profile not found. Contact support.' });
     }
 
     if (profile.approval_status === 'rejected') {
