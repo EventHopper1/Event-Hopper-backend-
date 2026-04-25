@@ -55,11 +55,17 @@ app.get('/health', (req, res) => {
 app.post('/api/auth/organizer-signup', async (req, res) => {
   try {
     const {
-      email, password, full_name,
-      business_name, phone, website, event_types, description,
+      email, password,
+      full_name, first_name, last_name,
+      business_name, business_type, phone, website,
+      event_types, description,
+      city, state,
     } = req.body;
 
-    if (!email || !password || !full_name || !business_name) {
+    // Build full_name from first/last if not provided directly
+    const fullName = full_name || `${first_name || ''} ${last_name || ''}`.trim();
+
+    if (!email || !password || !fullName || !business_name) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
@@ -83,51 +89,37 @@ app.post('/api/auth/organizer-signup', async (req, res) => {
       .insert({
         email: email.toLowerCase().trim(),
         password_hash,
-        full_name,
+        full_name: fullName,
         role: 'organizer',
-        is_active: true, // auto-approved for MVP
+        is_active: true,
       })
       .select()
       .single();
 
     if (userError) throw userError;
 
-    // Create organizer profile
+    // Create organizer profile — save ALL fields from the signup form
     const { error: profileError } = await supabase
       .from('organizer_profiles')
       .insert({
         user_id: newUser.id,
+        first_name: first_name || fullName.split(' ')[0] || null,
+        last_name: last_name || fullName.split(' ').slice(1).join(' ') || null,
         business_name,
+        business_type: business_type || event_types || null,
         phone: phone || null,
         website: website || null,
-        event_types: event_types || null,
+        city: city || null,
+        state: state || null,
+        event_types: event_types || business_type || null,
         description: description || null,
-        approval_status: 'approved',  // auto-approve for MVP
+        event_description: description || null,
+        approval_status: 'approved',
       });
 
     if (profileError) throw profileError;
 
-    // Notify Event Hopper team via email (if Resend configured)
-    if (resend) {
-      await resend.emails.send({
-        from: 'Event Hopper <noreply@eventhopper.com>',
-        to: 'team@eventhopper.com', // update to real team email
-        subject: `New organizer signup: ${business_name}`,
-        html: `
-          <h2>New Organizer Signup</h2>
-          <p><strong>Name:</strong> ${full_name}</p>
-          <p><strong>Business:</strong> ${business_name}</p>
-          <p><strong>Email:</strong> ${email}</p>
-          <p><strong>Phone:</strong> ${phone || 'N/A'}</p>
-          <p><strong>Website:</strong> ${website || 'N/A'}</p>
-          <p><strong>Event Types:</strong> ${event_types || 'N/A'}</p>
-          <p><strong>Description:</strong> ${description || 'N/A'}</p>
-          <p><a href="https://event-hopper-7.vercel.app/admin">Go to Admin Portal to approve →</a></p>
-        `,
-      }).catch(e => console.error('Email send error:', e));
-    }
-
-    res.json({ success: true, message: 'Application received! We\'ll review and reach out within 24 hours.' });
+    res.json({ success: true, message: 'Account created successfully!' });
   } catch (err) {
     console.error('Organizer signup error:', err);
     res.status(500).json({ error: err.message || 'Signup failed' });
